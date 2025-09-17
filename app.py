@@ -4,7 +4,7 @@ from src.scanner import HealthzScanner
 st.set_page_config(page_title="healthz.ca", page_icon="🍁")
 
 st.title("🍁 healthz.ca")
-st.subtitle("Canadian Barcode Nutrition Scanner")
+st.markdown("### Canadian Barcode Nutrition Scanner")
 
 scanner = HealthzScanner()
 
