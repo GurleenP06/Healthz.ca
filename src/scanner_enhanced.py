@@ -93,7 +93,7 @@ load_dotenv()
 
 # Setup logging
 logging.basicConfig(
-    level=os.getenv('LOG_LEVEL', 'INFO'),
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -266,205 +266,6 @@ class Product:
     predictions: Dict[str, Any] = field(default_factory=dict)
 
 # ============================================================================
-# SIMPLIFIED YOLO-BARCODE DETECTION MODULE
-# ============================================================================
-
-class YOLOBarcodeDetector:
-    """
-    Simplified barcode detection using YOLO architecture
-    Falls back to traditional methods if YOLO is not available
-    """
-    
-    def __init__(self, model_path: Optional[Path] = None):
-        self.device = Config.DEVICE
-        self.model = None
-        
-        if YOLO_AVAILABLE and model_path and model_path.exists():
-            self.load_model(model_path)
-        else:
-            self.initialize_fallback()
-    
-    def initialize_fallback(self):
-        """Initialize fallback detection methods"""
-        logger.info("Using fallback barcode detection (pyzbar)")
-        self.model = None
-    
-    def detect_barcodes(self, image: np.ndarray, enhance: bool = True) -> List[BarcodeDetection]:
-        """
-        Detect barcodes in image using available methods
-        
-        Args:
-            image: Input image as numpy array
-            enhance: Whether to apply image enhancement
-        
-        Returns:
-            List of detected barcodes with locations and confidence
-        """
-        if not CV_AVAILABLE:
-            logger.warning("Computer vision not available")
-            return []
-        
-        detections = []
-        
-        # Enhance image for better detection if needed
-        if enhance:
-            image = self._enhance_image_for_barcode(image)
-        
-        # Try YOLO if available
-        if self.model and YOLO_AVAILABLE:
-            detections = self._yolo_detection(image)
-        
-        # Fallback to traditional detection
-        if not detections:
-            detections = self._fallback_detection(image)
-        
-        return detections
-    
-    def _yolo_detection(self, image: np.ndarray) -> List[BarcodeDetection]:
-        """YOLO-based barcode detection"""
-        try:
-            results = self.model(image, conf=Config.CONFIDENCE_THRESHOLD)
-            
-            detections = []
-            for r in results:
-                boxes = r.boxes
-                if boxes is not None:
-                    for box in boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        conf = box.conf[0].item()
-                        cls = int(box.cls[0].item())
-                        
-                        # Extract barcode region
-                        barcode_region = image[int(y1):int(y2), int(x1):int(x2)]
-                        
-                        # Decode barcode
-                        barcode_data = self._decode_barcode_region(barcode_region)
-                        
-                        if barcode_data:
-                            detection = BarcodeDetection(
-                                barcode_data=barcode_data,
-                                barcode_type=self._classify_barcode_type(barcode_data),
-                                bounding_box=(int(x1), int(y1), int(x2-x1), int(y2-y1)),
-                                confidence=conf,
-                                orientation=0.0,
-                                image_quality_score=0.8
-                            )
-                            detections.append(detection)
-            
-            return detections
-            
-        except Exception as e:
-            logger.error(f"YOLO detection failed: {e}")
-            return []
-    
-    def _enhance_image_for_barcode(self, image: np.ndarray) -> np.ndarray:
-        """Apply image enhancement for barcode detection"""
-        if not CV_AVAILABLE:
-            return image
-        
-        # Convert to grayscale if needed
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-        
-        # Apply CLAHE for contrast enhancement
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        
-        # Convert back to 3-channel for YOLO
-        if len(image.shape) == 3:
-            enhanced_color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        else:
-            enhanced_color = enhanced
-        
-        return enhanced_color
-    
-    def _decode_barcode_region(self, region: np.ndarray) -> Optional[str]:
-        """Decode barcode from image region using multiple methods"""
-        if not CV_AVAILABLE:
-            return None
-        
-        # Try pyzbar first
-        barcodes = pyzbar.decode(region)
-        if barcodes:
-            return barcodes[0].data.decode('utf-8')
-        
-        # Try different preprocessing techniques
-        for preprocess in [
-            lambda x: x,  # Original
-            lambda x: cv2.rotate(x, cv2.ROTATE_90_CLOCKWISE),
-            lambda x: cv2.rotate(x, cv2.ROTATE_90_COUNTERCLOCKWISE),
-            lambda x: cv2.flip(x, 0),  # Vertical flip
-            lambda x: cv2.flip(x, 1),  # Horizontal flip
-        ]:
-            processed = preprocess(region)
-            barcodes = pyzbar.decode(processed)
-            if barcodes:
-                return barcodes[0].data.decode('utf-8')
-        
-        return None
-    
-    def _classify_barcode_type(self, barcode_data: str) -> BarcodeType:
-        """Classify barcode type based on data pattern"""
-        if not barcode_data:
-            return BarcodeType.UNKNOWN
-        
-        # Check length and pattern for common types
-        if len(barcode_data) == 13 and barcode_data.isdigit():
-            return BarcodeType.EAN13
-        elif len(barcode_data) == 8 and barcode_data.isdigit():
-            return BarcodeType.EAN8
-        elif len(barcode_data) == 12 and barcode_data.isdigit():
-            return BarcodeType.UPCA
-        elif len(barcode_data) in [6, 8] and barcode_data.isdigit():
-            return BarcodeType.UPCE
-        else:
-            return BarcodeType.CODE128  # Default for alphanumeric
-    
-    def _fallback_detection(self, image: np.ndarray) -> List[BarcodeDetection]:
-        """Fallback to traditional barcode detection"""
-        if not CV_AVAILABLE:
-            return []
-        
-        detections = []
-        
-        # Try multiple preprocessing techniques
-        for enhanced in [
-            image,
-            self._enhance_image_for_barcode(image),
-            cv2.GaussianBlur(image, (5, 5), 0),
-        ]:
-            barcodes = pyzbar.decode(enhanced)
-            
-            for barcode in barcodes:
-                points = barcode.polygon
-                if len(points) == 4:
-                    x = min(p.x for p in points)
-                    y = min(p.y for p in points)
-                    w = max(p.x for p in points) - x
-                    h = max(p.y for p in points) - y
-                    
-                    detection = BarcodeDetection(
-                        barcode_data=barcode.data.decode('utf-8'),
-                        barcode_type=self._classify_barcode_type(barcode.data.decode('utf-8')),
-                        bounding_box=(x, y, w, h),
-                        confidence=0.8,  # Default confidence for pyzbar
-                        orientation=0.0,
-                        image_quality_score=0.7
-                    )
-                    detections.append(detection)
-        
-        return detections
-    
-    def load_model(self, path: Path):
-        """Load trained model"""
-        if YOLO_AVAILABLE and path.suffix == '.pt':
-            self.model = YOLO(str(path))
-        else:
-            logger.warning("YOLO model loading not available")
-
-# ============================================================================
 # USDA FOODDATA CENTRAL API INTEGRATION
 # ============================================================================
 
@@ -482,6 +283,8 @@ class USDAFoodDataAPI:
     def search_by_upc(self, upc: str) -> Optional[Product]:
         """
         Search for product by UPC/barcode in USDA database
+        
+        The USDA API supports UPC codes in search queries
         """
         try:
             # Search using UPC as query
@@ -515,6 +318,21 @@ class USDAFoodDataAPI:
         
         return None
     
+    def get_food_details(self, fdc_id: str) -> Optional[Dict]:
+        """Get detailed food information by FDC ID"""
+        try:
+            url = f"{Config.USDA_FOOD_ENDPOINT}/{fdc_id}"
+            params = {'api_key': self.api_key}
+            
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Failed to get food details for FDC ID {fdc_id}: {e}")
+            return None
+    
     def _parse_usda_food(self, food_data: Dict) -> Product:
         """Parse USDA food data into Product model"""
         
@@ -524,9 +342,9 @@ class USDAFoodDataAPI:
         # Build product
         product = Product(
             barcode=food_data.get('gtinUpc', ''),
+            name=food_data.get('description', ''),
             gtin=food_data.get('gtinUpc'),
             fdc_id=str(food_data.get('fdcId', '')),
-            name=food_data.get('description', ''),
             brand=food_data.get('brandOwner'),
             manufacturer=food_data.get('brandOwner'),
             category=food_data.get('foodCategory'),
@@ -628,39 +446,57 @@ class MultiSourceDataAggregator:
     - USDA FoodData Central
     - OpenFoodFacts
     - Canadian retailers
+    - Edamam (if available)
     """
     
     def __init__(self):
         self.usda_api = USDAFoodDataAPI()
-        self.scraper = requests.Session()
+        if SCRAPING_AVAILABLE:
+            self.scraper = cloudscraper.create_scraper()
+        else:
+            self.scraper = None
         self.cache = {}
         
     def get_product_data(self, barcode: str, sources: List[str] = None) -> Product:
         """
         Get product data from multiple sources and aggregate
+        
+        Args:
+            barcode: Product barcode/UPC
+            sources: List of sources to use (defaults to all)
+        
+        Returns:
+            Aggregated product data with confidence scores
         """
         
         if sources is None:
-            sources = ['usda', 'openfoodfacts']
+            sources = ['usda', 'openfoodfacts', 'canadian_retailers']
         
         products = []
         
-        # Try each source
-        if 'usda' in sources:
-            try:
-                product = self.usda_api.search_by_upc(barcode)
-                if product:
-                    products.append(product)
-            except Exception as e:
-                logger.error(f"USDA search failed: {e}")
-        
-        if 'openfoodfacts' in sources:
-            try:
-                product = self._query_openfoodfacts(barcode)
-                if product:
-                    products.append(product)
-            except Exception as e:
-                logger.error(f"OpenFoodFacts search failed: {e}")
+        # Try each source in parallel
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
+            
+            if 'usda' in sources:
+                futures['usda'] = executor.submit(self.usda_api.search_by_upc, barcode)
+            
+            if 'openfoodfacts' in sources:
+                futures['openfoodfacts'] = executor.submit(self._query_openfoodfacts, barcode)
+            
+            if 'canadian_retailers' in sources and SCRAPING_AVAILABLE:
+                futures['loblaws'] = executor.submit(self._scrape_loblaws, barcode)
+                futures['metro'] = executor.submit(self._scrape_metro, barcode)
+            
+            # Collect results
+            for source, future in futures.items():
+                try:
+                    result = future.result(timeout=10)
+                    if result:
+                        result.data_sources.append(source)
+                        products.append(result)
+                except Exception as e:
+                    logger.error(f"Failed to get data from {source}: {e}")
         
         # Aggregate results
         if products:
@@ -763,6 +599,9 @@ class MultiSourceDataAggregator:
     def _query_openfoodfacts(self, barcode: str) -> Optional[Product]:
         """Query OpenFoodFacts database"""
         try:
+            if not self.scraper:
+                return None
+                
             url = f"https://world.openfoodfacts.org/api/v2/product/{barcode}"
             response = self.scraper.get(url)
             
@@ -804,77 +643,568 @@ class MultiSourceDataAggregator:
             confidence_score=0.8,
             data_sources=['OpenFoodFacts']
         )
+    
+    def _scrape_loblaws(self, barcode: str) -> Optional[Product]:
+        """Scrape Loblaws/PC products"""
+        # Implementation for Loblaws scraping
+        # This would involve web scraping with proper headers and parsing
+        if not SCRAPING_AVAILABLE:
+            return None
+            
+        try:
+            # Placeholder for Loblaws scraping
+            # Would use Selenium or requests with proper headers
+            logger.info(f"Loblaws scraping not implemented for {barcode}")
+            return None
+        except Exception as e:
+            logger.error(f"Loblaws scraping failed: {e}")
+            return None
+    
+    def _scrape_metro(self, barcode: str) -> Optional[Product]:
+        """Scrape Metro products"""
+        # Implementation for Metro scraping
+        if not SCRAPING_AVAILABLE:
+            return None
+            
+        try:
+            # Placeholder for Metro scraping
+            # Would use Selenium or requests with proper headers
+            logger.info(f"Metro scraping not implemented for {barcode}")
+            return None
+        except Exception as e:
+            logger.error(f"Metro scraping failed: {e}")
+            return None
+
+# ============================================================================
+# ENHANCED ML NUTRITION PREDICTOR
+# ============================================================================
+
+class EnhancedNutritionPredictor:
+    """
+    Advanced ML model for predicting nutrition from product features
+    Uses ensemble of deep learning and gradient boosting
+    """
+    
+    def __init__(self):
+        self.device = Config.DEVICE
+        if ML_AVAILABLE:
+            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        else:
+            self.embedding_model = None
+        self.neural_model = None
+        self.xgb_models = {}
+        self.lgb_models = {}
+        self.scalers = {}
+        self.is_trained = False
+        
+    def train(self, products: List[Product], validation_split: float = 0.2):
+        """Train all models in the ensemble"""
+        
+        if not ML_AVAILABLE:
+            logger.warning("ML libraries not available, skipping training")
+            return
+        
+        # Prepare features and targets
+        X, y, nutrient_names = self._prepare_training_data(products)
+        
+        if len(X) == 0:
+            logger.error("No valid training data")
+            return
+        
+        # Split data
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=validation_split, random_state=42
+        )
+        
+        # Train models for each nutrient
+        for i, nutrient in enumerate(nutrient_names):
+            logger.info(f"Training model for {nutrient}")
+            
+            # Scale features
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_val_scaled = scaler.transform(X_val)
+            self.scalers[nutrient] = scaler
+            
+            # Extract target for this nutrient
+            y_train_nutrient = y_train[:, i]
+            y_val_nutrient = y_val[:, i]
+            
+            # Train XGBoost
+            xgb_model = xgb.XGBRegressor(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
+                objective='reg:squarederror'
+            )
+            xgb_model.fit(X_train_scaled, y_train_nutrient)
+            self.xgb_models[nutrient] = xgb_model
+            
+            # Train LightGBM
+            lgb_model = lgb.LGBMRegressor(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1
+            )
+            lgb_model.fit(X_train_scaled, y_train_nutrient)
+            self.lgb_models[nutrient] = lgb_model
+            
+            # Evaluate
+            xgb_pred = xgb_model.predict(X_val_scaled)
+            lgb_pred = lgb_model.predict(X_val_scaled)
+            ensemble_pred = (xgb_pred + lgb_pred) / 2
+            
+            mae = mean_absolute_error(y_val_nutrient, ensemble_pred)
+            logger.info(f"{nutrient} MAE: {mae:.2f}")
+        
+        self.is_trained = True
+    
+    def predict(self, product: Product) -> NutritionInfo:
+        """Predict nutrition for a product"""
+        
+        if not self.is_trained or not ML_AVAILABLE:
+            logger.warning("Model not trained or ML not available, returning empty nutrition")
+            return NutritionInfo()
+        
+        # Extract features
+        features = self._extract_features(product)
+        
+        # Predict each nutrient
+        nutrition = NutritionInfo()
+        
+        for nutrient, scaler in self.scalers.items():
+            features_scaled = scaler.transform(features.reshape(1, -1))
+            
+            # Ensemble prediction
+            predictions = []
+            
+            if nutrient in self.xgb_models:
+                predictions.append(self.xgb_models[nutrient].predict(features_scaled)[0])
+            
+            if nutrient in self.lgb_models:
+                predictions.append(self.lgb_models[nutrient].predict(features_scaled)[0])
+            
+            if predictions:
+                value = np.mean(predictions)
+                setattr(nutrition, nutrient, float(value))
+        
+        nutrition.data_source = 'ML Prediction'
+        nutrition.confidence_score = 0.7  # ML predictions have lower confidence
+        
+        return nutrition
+    
+    def _prepare_training_data(self, products: List[Product]) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Prepare training data from products"""
+        
+        features = []
+        targets = []
+        valid_products = []
+        
+        # Filter products with nutrition data
+        for product in products:
+            if product.nutrition and product.nutrition.calories is not None:
+                valid_products.append(product)
+        
+        if not valid_products:
+            return np.array([]), np.array([]), []
+        
+        # Define target nutrients
+        target_nutrients = [
+            'calories', 'protein', 'total_fat', 
+            'total_carbohydrates', 'sodium'
+        ]
+        
+        # Extract features and targets
+        for product in valid_products:
+            # Extract features
+            feature_vec = self._extract_features(product)
+            features.append(feature_vec)
+            
+            # Extract targets
+            target_vec = []
+            for nutrient in target_nutrients:
+                value = getattr(product.nutrition, nutrient, 0) or 0
+                target_vec.append(value)
+            targets.append(target_vec)
+        
+        return np.array(features), np.array(targets), target_nutrients
+    
+    def _extract_features(self, product: Product) -> np.ndarray:
+        """Extract feature vector from product"""
+        
+        if not self.embedding_model:
+            # Fallback to simple features
+            text_parts = []
+            if product.name:
+                text_parts.append(f"Product: {product.name}")
+            if product.brand:
+                text_parts.append(f"Brand: {product.brand}")
+            if product.category:
+                text_parts.append(f"Category: {product.category}")
+            if product.ingredients:
+                text_parts.append(f"Ingredients: {', '.join(product.ingredients[:20])}")
+            
+            text = " ".join(text_parts) or "Unknown product"
+            
+            # Simple text features
+            text_features = [
+                len(text),
+                text.count('organic'),
+                text.count('sugar-free'),
+                text.count('low-fat'),
+                text.count('gluten-free'),
+                text.count('natural'),
+                text.count('healthy'),
+            ]
+            
+            # Numerical features
+            num_features = [
+                len(product.name) if product.name else 0,
+                len(product.ingredients) if product.ingredients else 0,
+                1 if product.brand else 0,
+                1 if product.category else 0,
+            ]
+            
+            # Combine features
+            feature_vector = np.array(text_features + num_features)
+            
+        else:
+            # Text features using sentence embeddings
+            text_parts = []
+            if product.name:
+                text_parts.append(f"Product: {product.name}")
+            if product.brand:
+                text_parts.append(f"Brand: {product.brand}")
+            if product.category:
+                text_parts.append(f"Category: {product.category}")
+            if product.ingredients:
+                text_parts.append(f"Ingredients: {', '.join(product.ingredients[:20])}")
+            
+            text = " ".join(text_parts) or "Unknown product"
+            text_embedding = self.embedding_model.encode(text)
+            
+            # Numerical features
+            num_features = [
+                len(product.name) if product.name else 0,
+                len(product.ingredients) if product.ingredients else 0,
+                1 if product.brand else 0,
+                1 if product.category else 0,
+                1 if 'organic' in text.lower() else 0,
+                1 if 'sugar-free' in text.lower() else 0,
+                1 if 'low-fat' in text.lower() else 0,
+                1 if 'gluten-free' in text.lower() else 0,
+            ]
+            
+            # Combine features
+            feature_vector = np.concatenate([text_embedding, num_features])
+        
+        return feature_vector
+    
+    def save_models(self, path: Path):
+        """Save trained models"""
+        models_data = {
+            'xgb_models': self.xgb_models,
+            'lgb_models': self.lgb_models,
+            'scalers': self.scalers,
+            'is_trained': self.is_trained
+        }
+        
+        with open(path, 'wb') as f:
+            pickle.dump(models_data, f)
+    
+    def load_models(self, path: Path):
+        """Load trained models"""
+        with open(path, 'rb') as f:
+            models_data = pickle.load(f)
+        
+        self.xgb_models = models_data['xgb_models']
+        self.lgb_models = models_data['lgb_models']
+        self.scalers = models_data['scalers']
+        self.is_trained = models_data['is_trained']
 
 # ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 
-class HealthzScanner:
+class AdvancedNutritionScannerPipeline:
     """
-    Main scanner class for healthz.ca
-    Simplified version of the advanced pipeline
+    Complete pipeline integrating:
+    - YOLO-Barcode detection
+    - USDA FoodData Central
+    - Multi-source data aggregation
+    - ML nutrition prediction
     """
     
     def __init__(self):
-        logger.info("Initializing Healthz Scanner")
+        logger.info("Initializing Advanced Nutrition Scanner Pipeline")
         
         # Initialize components
-        self.barcode_detector = YOLOBarcodeDetector()
+        if CV_AVAILABLE:
+            from .yolo_detector import YOLOBarcodeDetector
+            self.barcode_detector = YOLOBarcodeDetector()
+        else:
+            self.barcode_detector = None
+            
         self.data_aggregator = MultiSourceDataAggregator()
+        self.nutrition_predictor = EnhancedNutritionPredictor()
+        self.database = self._init_database()
         
-        # Check API key
-        if Config.USDA_API_KEY == 'DEMO_KEY':
-            logger.warning("Using DEMO_KEY - limited to 30 requests/hour")
+        # Load models if available
+        self._load_models()
     
-    def scan_barcode(self, barcode: str) -> Optional[Product]:
+    def _init_database(self) -> sqlite3.Connection:
+        """Initialize SQLite database"""
+        conn = sqlite3.connect(str(Config.DATABASE_PATH), check_same_thread=False)
+        
+        # Create tables
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS products (
+            barcode TEXT PRIMARY KEY,
+            gtin TEXT,
+            fdc_id TEXT,
+            name TEXT,
+            brand TEXT,
+            category TEXT,
+            ingredients TEXT,
+            allergens TEXT,
+            nutrition TEXT,
+            confidence_score REAL,
+            data_sources TEXT,
+            last_updated TIMESTAMP
+        )
+        ''')
+        
+        conn.commit()
+        return conn
+    
+    def _load_models(self):
+        """Load pre-trained models if available"""
+        
+        # Load YOLO-Barcode model
+        if Config.YOLO_BARCODE_PATH.exists() and self.barcode_detector:
+            logger.info("Loading YOLO-Barcode model")
+            self.barcode_detector.load_model(Config.YOLO_BARCODE_PATH)
+        
+        # Load nutrition predictor
+        nutrition_model_path = Config.MODELS_DIR / "nutrition_models.pkl"
+        if nutrition_model_path.exists():
+            logger.info("Loading nutrition prediction models")
+            self.nutrition_predictor.load_models(nutrition_model_path)
+    
+    def scan_and_analyze(self, 
+                        image_source: Union[str, np.ndarray],
+                        enhance_image: bool = True,
+                        use_ml_prediction: bool = True) -> Dict[str, Any]:
         """
-        Look up product information by barcode
+        Complete pipeline: scan -> detect -> fetch data -> predict
         
         Args:
-            barcode: UPC/EAN barcode string
-            
+            image_source: Path to image file or numpy array
+            enhance_image: Whether to enhance image for better detection
+            use_ml_prediction: Whether to use ML for missing nutrition data
+        
         Returns:
-            Product object with nutrition info or None
+            Dictionary with detected barcodes and product information
         """
-        logger.info(f"Scanning barcode: {barcode}")
         
-        # Get product data from multiple sources
-        product = self.data_aggregator.get_product_data(barcode)
+        results = {
+            'timestamp': datetime.now().isoformat(),
+            'detections': [],
+            'products': []
+        }
         
-        if product and product.name != "Unknown Product":
-            return product
+        # Load image if path provided
+        if isinstance(image_source, str):
+            if CV_AVAILABLE:
+                image = cv2.imread(image_source)
+            else:
+                logger.error("OpenCV not available for image loading")
+                return results
+        else:
+            image = image_source
+        
+        # Step 1: Detect barcodes
+        logger.info("Detecting barcodes...")
+        if self.barcode_detector:
+            detections = self.barcode_detector.detect_barcodes(image, enhance=enhance_image)
+        else:
+            logger.warning("Barcode detector not available")
+            detections = []
+            
+        results['detections'] = [asdict(d) for d in detections]
+        
+        if not detections:
+            logger.warning("No barcodes detected")
+            return results
+        
+        # Step 2: Process each detected barcode
+        for detection in detections:
+            logger.info(f"Processing barcode: {detection.barcode_data}")
+            
+            # Check cache
+            cached_product = self._get_cached_product(detection.barcode_data)
+            
+            if cached_product:
+                logger.info("Using cached product data")
+                product = cached_product
+            else:
+                # Fetch from multiple sources
+                logger.info("Fetching product data from APIs...")
+                product = self.data_aggregator.get_product_data(detection.barcode_data)
+                
+                # Use ML prediction if needed
+                if use_ml_prediction and (not product.nutrition or 
+                                         product.confidence_score < 0.6):
+                    logger.info("Using ML to predict nutrition...")
+                    predicted_nutrition = self.nutrition_predictor.predict(product)
+                    
+                    if not product.nutrition or self._nutrition_completeness(predicted_nutrition) > \
+                       self._nutrition_completeness(product.nutrition):
+                        product.nutrition = predicted_nutrition
+                        product.predictions['nutrition'] = 'ML Enhanced'
+                
+                # Cache the product
+                self._cache_product(product)
+            
+            # Add detection info to product
+            product.predictions['detection_confidence'] = detection.confidence
+            product.predictions['barcode_type'] = detection.barcode_type.value
+            product.predictions['image_quality'] = detection.image_quality_score
+            
+            results['products'].append(asdict(product))
+        
+        return results
+    
+    def _nutrition_completeness(self, nutrition: Optional[NutritionInfo]) -> float:
+        """Calculate nutrition completeness score"""
+        if not nutrition:
+            return 0.0
+        
+        essential_fields = [
+            'calories', 'total_fat', 'protein', 
+            'total_carbohydrates', 'sodium'
+        ]
+        
+        complete = sum(1 for field in essential_fields 
+                      if getattr(nutrition, field) is not None)
+        
+        return complete / len(essential_fields)
+    
+    def _get_cached_product(self, barcode: str) -> Optional[Product]:
+        """Get product from cache"""
+        try:
+            cursor = self.database.cursor()
+            cursor.execute(
+                "SELECT * FROM products WHERE barcode = ?",
+                (barcode,)
+            )
+            row = cursor.fetchone()
+            
+            if row:
+                # Deserialize product
+                product = Product(
+                    barcode=row[0],
+                    gtin=row[1],
+                    fdc_id=row[2],
+                    name=row[3],
+                    brand=row[4],
+                    category=row[5],
+                    ingredients=json.loads(row[6]) if row[6] else None,
+                    allergens=json.loads(row[7]) if row[7] else None,
+                    nutrition=json.loads(row[8]) if row[8] else None,
+                    confidence_score=row[9],
+                    data_sources=json.loads(row[10]) if row[10] else [],
+                    last_updated=datetime.fromisoformat(row[11])
+                )
+                
+                # Check if cache is fresh (less than 7 days old)
+                if (datetime.now() - product.last_updated).days < 7:
+                    return product
+        
+        except Exception as e:
+            logger.error(f"Cache retrieval failed: {e}")
         
         return None
     
-    def scan_image(self, image_path: str) -> List[Product]:
-        """
-        Scan image for barcodes and return products
+    def _cache_product(self, product: Product):
+        """Cache product in database"""
+        try:
+            cursor = self.database.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                product.barcode,
+                product.gtin,
+                product.fdc_id,
+                product.name,
+                product.brand,
+                product.category,
+                json.dumps(product.ingredients),
+                json.dumps(product.allergens),
+                json.dumps(asdict(product.nutrition)) if product.nutrition else None,
+                product.confidence_score,
+                json.dumps(product.data_sources),
+                datetime.now().isoformat()
+            ))
+            self.database.commit()
         
-        Args:
-            image_path: Path to image file
-            
-        Returns:
-            List of Product objects
-        """
-        if not CV_AVAILABLE:
-            logger.error("Computer vision not available")
-            return []
+        except Exception as e:
+            logger.error(f"Failed to cache product: {e}")
+    
+    def train_models(self, training_data_path: Optional[str] = None):
+        """Train all ML models"""
         
-        # Load image
-        image = cv2.imread(image_path)
-        if image is None:
-            logger.error(f"Could not load image: {image_path}")
-            return []
+        logger.info("Starting model training...")
         
-        # Detect barcodes
-        detections = self.barcode_detector.detect_barcodes(image)
+        # Collect or load training data
+        if training_data_path:
+            with open(training_data_path, 'rb') as f:
+                products = pickle.load(f)
+        else:
+            # Collect training data from APIs
+            logger.info("Collecting training data...")
+            products = self._collect_training_data()
+        
+        # Train nutrition predictor
+        logger.info("Training nutrition prediction models...")
+        self.nutrition_predictor.train(products)
+        
+        # Save models
+        self.nutrition_predictor.save_models(Config.MODELS_DIR / "nutrition_models.pkl")
+        
+        logger.info("Training complete!")
+    
+    def _collect_training_data(self) -> List[Product]:
+        """Collect training data from various sources"""
         
         products = []
-        for detection in detections:
-            product = self.scan_barcode(detection.barcode_data)
-            if product:
-                products.append(product)
         
+        # Common UPC prefixes for major brands
+        upc_prefixes = [
+            "0681310",  # No Name
+            "0660100",  # President's Choice
+            "0557425",  # Compliments
+            "0627843",  # Great Value
+            "0380000",  # Kraft
+            "0430000",  # General Mills
+            "0160000",  # Coca-Cola
+            "0120000",  # Pepsi
+        ]
+        
+        # Generate sample UPCs and fetch data
+        for prefix in upc_prefixes:
+            for i in range(10):  # Get 10 products per prefix
+                # Generate valid UPC (simplified)
+                upc = f"{prefix}{str(i).zfill(5)}"
+                
+                try:
+                    product = self.data_aggregator.get_product_data(upc)
+                    if product and product.nutrition:
+                        products.append(product)
+                except Exception as e:
+                    logger.error(f"Failed to get data for {upc}: {e}")
+        
+        logger.info(f"Collected {len(products)} products for training")
         return products
 
 # ============================================================================
@@ -882,61 +1212,221 @@ class HealthzScanner:
 # ============================================================================
 
 def main():
-    """CLI interface"""
+    """Enhanced CLI for the nutrition scanner"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='healthz.ca Barcode Scanner')
-    parser.add_argument('--barcode', type=str, help='Barcode to scan')
-    parser.add_argument('--image', type=str, help='Image file to scan')
-    parser.add_argument('--mode', choices=['barcode', 'image'], default='barcode', help='Scan mode')
+    parser = argparse.ArgumentParser(
+        description='Advanced Barcode Nutrition Scanner with YOLO and USDA Integration'
+    )
+    
+    parser.add_argument('--mode', 
+                       choices=['scan', 'camera', 'train', 'batch', 'test'],
+                       default='scan',
+                       help='Operation mode')
+    
+    parser.add_argument('--image', 
+                       type=str,
+                       help='Path to image file for scanning')
+    
+    parser.add_argument('--barcode',
+                       type=str,
+                       help='Direct barcode/UPC input')
+    
+    parser.add_argument('--enhance',
+                       action='store_true',
+                       help='Enable image enhancement')
+    
+    parser.add_argument('--sources',
+                       nargs='+',
+                       choices=['usda', 'openfoodfacts', 'canadian_retailers'],
+                       help='Data sources to use')
+    
+    parser.add_argument('--output',
+                       type=str,
+                       help='Output file for results (JSON)')
+    
     args = parser.parse_args()
     
-    scanner = HealthzScanner()
+    # Initialize pipeline
+    pipeline = AdvancedNutritionScannerPipeline()
     
-    if args.mode == 'barcode':
+    if args.mode == 'scan':
         if args.barcode:
-            barcode = args.barcode
+            # Direct barcode lookup
+            product = pipeline.data_aggregator.get_product_data(args.barcode, args.sources)
+            result = {'products': [asdict(product)]}
+        elif args.image:
+            # Scan from image
+            result = pipeline.scan_and_analyze(args.image, enhance_image=args.enhance)
         else:
-            barcode = input("Enter barcode: ")
-        
-        product = scanner.scan_barcode(barcode)
-        
-        if product:
-            print(f"\n{'='*50}")
-            print(f"Product: {product.name}")
-            print(f"Brand: {product.brand or 'N/A'}")
-            print(f"Category: {product.category or 'N/A'}")
-            
-            if product.nutrition:
-                print(f"\nNutrition Facts:")
-                print(f"  Calories: {product.nutrition.calories or 'N/A'}")
-                print(f"  Protein: {product.nutrition.protein or 'N/A'} g")
-                print(f"  Fat: {product.nutrition.total_fat or 'N/A'} g")
-                print(f"  Carbs: {product.nutrition.total_carbohydrates or 'N/A'} g")
-                print(f"  Sodium: {product.nutrition.sodium or 'N/A'} mg")
-            
-            print(f"\nSources: {', '.join(product.data_sources)}")
-            print(f"Confidence: {product.confidence_score:.1%}")
-            print(f"{'='*50}\n")
-        else:
-            print("Product not found")
-    
-    elif args.mode == 'image':
-        if not args.image:
-            print("Please provide --image path")
+            print("Please provide --image or --barcode")
             return
         
-        products = scanner.scan_image(args.image)
+        # Display results
+        if result.get('products'):
+            for product_data in result['products']:
+                print("\n" + "="*60)
+                print(f"PRODUCT: {product_data.get('name', 'Unknown')}")
+                print(f"BRAND: {product_data.get('brand', 'N/A')}")
+                print(f"BARCODE: {product_data.get('barcode')}")
+                
+                if product_data.get('fdc_id'):
+                    print(f"USDA FDC ID: {product_data['fdc_id']}")
+                
+                print(f"DATA SOURCES: {', '.join(product_data.get('data_sources', []))}")
+                print(f"CONFIDENCE: {product_data.get('confidence_score', 0):.1%}")
+                
+                nutrition = product_data.get('nutrition')
+                if nutrition:
+                    print("\nNUTRITION FACTS (per serving)")
+                    print("-"*40)
+                    
+                    # Display key nutrients
+                    nutrients = [
+                        ('Calories', 'calories', ''),
+                        ('Total Fat', 'total_fat', 'g'),
+                        ('  Saturated Fat', 'saturated_fat', 'g'),
+                        ('  Trans Fat', 'trans_fat', 'g'),
+                        ('Cholesterol', 'cholesterol', 'mg'),
+                        ('Sodium', 'sodium', 'mg'),
+                        ('Total Carbohydrates', 'total_carbohydrates', 'g'),
+                        ('  Dietary Fiber', 'dietary_fiber', 'g'),
+                        ('  Sugars', 'sugars', 'g'),
+                        ('Protein', 'protein', 'g')
+                    ]
+                    
+                    for label, key, unit in nutrients:
+                        value = nutrition.get(key)
+                        if value is not None:
+                            print(f"{label}: {value:.1f}{unit}")
+                        else:
+                            print(f"{label}: N/A")
+                    
+                    if nutrition.get('data_source'):
+                        print(f"\nSource: {nutrition['data_source']}")
+                
+                if product_data.get('ingredients'):
+                    print(f"\nINGREDIENTS: {', '.join(product_data['ingredients'][:10])}")
+                    if len(product_data['ingredients']) > 10:
+                        print(f"... and {len(product_data['ingredients']) - 10} more")
         
-        if products:
-            print(f"\nFound {len(products)} products:")
-            for i, product in enumerate(products, 1):
-                print(f"\n{i}. {product.name} ({product.barcode})")
-                print(f"   Brand: {product.brand or 'N/A'}")
-                print(f"   Confidence: {product.confidence_score:.1%}")
-        else:
-            print("No products found in image")
+        # Save to file if requested
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(result, f, indent=2, default=str)
+            print(f"\nResults saved to {args.output}")
+    
+    elif args.mode == 'camera':
+        if not CV_AVAILABLE:
+            print("OpenCV not available for camera mode")
+            return
+            
+        print("Starting camera capture... Press 'q' to quit, SPACE to capture")
+        cap = cv2.VideoCapture(0)
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Detect barcodes in real-time
+            if pipeline.barcode_detector:
+                detections = pipeline.barcode_detector.detect_barcodes(frame, enhance=False)
+                
+                # Draw bounding boxes
+                for detection in detections:
+                    x, y, w, h = detection.bounding_box
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    
+                    # Draw label
+                    label = f"{detection.barcode_type.value}: {detection.barcode_data}"
+                    cv2.putText(frame, label, (x, y - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            cv2.imshow('Barcode Scanner', frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord(' '):  # Spacebar to capture and analyze
+                if detections:
+                    print("\nAnalyzing detected barcodes...")
+                    result = pipeline.scan_and_analyze(frame)
+                    for product in result.get('products', []):
+                        print(f"Found: {product.get('name', 'Unknown')} - {product.get('barcode')}")
+        
+        cap.release()
+        cv2.destroyAllWindows()
+    
+    elif args.mode == 'train':
+        print("Starting model training...")
+        pipeline.train_models()
+        print("Training complete!")
+    
+    elif args.mode == 'batch':
+        print("Batch processing mode")
+        barcodes_input = input("Enter barcodes separated by commas: ")
+        barcodes = [b.strip() for b in barcodes_input.split(',')]
+        
+        results = []
+        for barcode in barcodes:
+            print(f"\nProcessing {barcode}...")
+            product = pipeline.data_aggregator.get_product_data(barcode)
+            results.append(asdict(product))
+            
+            print(f"  Name: {product.name}")
+            print(f"  Brand: {product.brand}")
+            print(f"  Confidence: {product.confidence_score:.1%}")
+        
+        # Save results
+        output_file = f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"\nResults saved to {output_file}")
+    
+    elif args.mode == 'test':
+        print("Running system tests...")
+        run_tests(pipeline)
 
+def run_tests(pipeline):
+    """Run system tests"""
+    
+    print("\n1. Testing USDA API...")
+    test_upcs = [
+        "041318020007",  # Kroger Milk
+        "078742022475",  # Great Value Water
+        "038000845512",  # Kellogg's Cereal
+    ]
+    
+    for upc in test_upcs:
+        product = pipeline.data_aggregator.usda_api.search_by_upc(upc)
+        if product:
+            print(f"✓ Found: {product.name} (FDC ID: {product.fdc_id})")
+        else:
+            print(f"✗ Not found: {upc}")
+    
+    print("\n2. Testing barcode detection...")
+    if CV_AVAILABLE:
+        # Create test image with barcode
+        test_image = np.ones((480, 640, 3), dtype=np.uint8) * 255
+        cv2.putText(test_image, "TEST BARCODE", (200, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        
+        if pipeline.barcode_detector:
+            detections = pipeline.barcode_detector.detect_barcodes(test_image, enhance=False)
+            print(f"Detected {len(detections)} barcodes")
+        else:
+            print("Barcode detector not available")
+    else:
+        print("OpenCV not available for testing")
+    
+    print("\n3. Testing multi-source aggregation...")
+    test_barcode = "0681310084641"  # No Name product
+    product = pipeline.data_aggregator.get_product_data(test_barcode)
+    print(f"Sources used: {', '.join(product.data_sources)}")
+    print(f"Completeness score: {product.confidence_score:.1%}")
+    
+    print("\nTests complete!")
 
 if __name__ == "__main__":
     main()
